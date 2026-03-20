@@ -13,7 +13,7 @@ def create_app():
     app = Flask(__name__) #creating app object
     app.config.from_object(Config) #loads config constraints
 
-    cors_origins_env = os.getenv("CORS_ORIGINS", "")
+    cors_origins_env = os.getenv("CORS_ORIGIN", "")
     cors_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
     if not cors_origins:
         cors_origins = ["https://chriskeenan.net/", "http://127.0.0.1:3000"]
