@@ -11,8 +11,9 @@ def require_admin(config): #Defines a function that takes config and returns ano
     def decorator(fn): #defines the deco that receives a function and returns a wrapped function
         @wraps(fn) #applies wraps to the wrapper function defined next
         def wrapper(*args, **kwargs): #defines a new function which accepts any positiona;/keyword arguments
+            resolved_config = config() if callable(config) else config
             token = request.headers.get("X-Admin-Token", "") #reads a header request, if missing - returns empty string
-            if token != config["ADMIN_TOKEN"]: #checking token against admin token in config
+            if token != resolved_config["ADMIN_TOKEN"]: #checking token against admin token in config
                 return jsonify({"error": "admin_required"}), 403
             return fn(*args, **kwargs) #returns the original route function which was wrapped
         return wrapper #decorator returns the wrapper function

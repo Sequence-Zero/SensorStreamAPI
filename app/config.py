@@ -5,3 +5,4 @@ class Config:
     SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL", "sqlite:///sensorstream.db")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-admin-token")
+    DEBUG_DEMO = os.getenv("DEBUG_DEMO", "0") == "1"

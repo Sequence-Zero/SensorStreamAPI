@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from flask import Blueprint, request, jsonify, g
+from flask import Blueprint, request, jsonify, g, current_app
 from ..models import Reading
 from ..auth import require_device_api_key
 from sqlalchemy import func
@@ -38,6 +38,7 @@ def get_readings():
     device_id = g.device.id
 
     sensor = (request.args.get("sensor") or "").strip()
+    requested_session_id = (request.args.get("session_id") or "").strip()
     start = (request.args.get("start") or "").strip()
     end = (request.args.get("end") or "").strip()
 
@@ -64,6 +65,11 @@ def get_readings():
         return jsonify({"error": "start_after_end"}), 400
     # Build query
     q = Reading.query.filter(Reading.device_id == device_id)
+    effective_session_id = requested_session_id or g.device.active_session_id
+    if requested_session_id:
+        q = q.filter(Reading.session_id == requested_session_id)
+    elif g.device.active_session_id:
+        q = q.filter(Reading.session_id == g.device.active_session_id)
 
     if sensor:
         q = q.filter(Reading.sensor == sensor)
@@ -78,18 +84,43 @@ def get_readings():
     q = q.order_by(
     Reading.ts.asc() if order == "asc" else Reading.ts.desc()).offset(offset).limit(limit)
 
-    rows = [{"ts": r.ts.isoformat(), "sensor": r.sensor, "value": r.value} for r in q.all()]
+    rows = [
+        {
+            "ts": r.ts.isoformat(),
+            "created_at": r.created_at.isoformat(),
+            "sensor": r.sensor,
+            "value": r.value,
+            "session_id": r.session_id,
+        }
+        for r in q.all()
+    ]
+    if current_app.config.get("DEBUG_DEMO", False):
+        print(
+            f"[readings] device={device_id} requested_session={requested_session_id or None} "
+            f"active_session={g.device.active_session_id} effective_session={effective_session_id} "
+            f"returned={len(rows)}"
+        )
 
-    return jsonify({
+    response = {
         "device_id": device_id,
         "sensor": sensor or None,
         "start": start_dt.isoformat() if start_dt else None,
         "end": end_dt.isoformat() if end_dt else None,
+        "session_id": effective_session_id,
         "order": order,
         "limit": limit,
         "count": len(rows),
-        "readings": rows
-    }), 200
+        "readings": rows,
+    }
+    if current_app.config.get("DEBUG_DEMO", False):
+        response["debug"] = {
+            "requested_session_id": requested_session_id or None,
+            "active_session_id": g.device.active_session_id,
+            "effective_session_id": effective_session_id,
+            "device_id": g.device.id,
+            "returned_count": len(rows),
+        }
+    return jsonify(response), 200
 
 @bp.get("/sensors")  # GET /api/sensors
 @require_device_api_key

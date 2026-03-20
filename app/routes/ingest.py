@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from flask import Blueprint, request, jsonify, g
+from flask import Blueprint, request, jsonify, g, current_app
 from ..extensions import db
 from ..models import Reading
 from ..auth import require_device_api_key
@@ -33,9 +33,20 @@ def parse_ts(ts_str: str): #formatting timezone data
 def ingest(): #defining ingest method
     payload = request.get_json(silent=True) or {}
     readings = payload.get("readings")
+    payload_session_id = payload.get("session_id")
+    payload_demo_session_id = payload.get("demo_session_id")
+    payload_debug_session_id = payload_session_id or payload_demo_session_id
+    if payload_session_id is not None and not isinstance(payload_session_id, str):
+        return jsonify({"error": "session_id_must_be_string"}), 400
+    if payload_demo_session_id is not None and not isinstance(payload_demo_session_id, str):
+        return jsonify({"error": "demo_session_id_must_be_string"}), 400
 
     if not isinstance(readings, list) or len(readings) == 0:
         return jsonify({"error": "readings_list_required"}), 400 #fails to initialize empty data
+
+    # Resolve exactly one session for the full request:
+    # A) session_id, B) demo_session_id, C) device.active_session_id, D) None.
+    resolved_session_id = payload_session_id or payload_demo_session_id or g.device.active_session_id
 
     accepted = 0
     rejected = 0
@@ -78,14 +89,33 @@ def ingest(): #defining ingest method
             device_id=g.device.id, #reads device id
             sensor=sensor, #reads sensor type
             ts=ts, #reads local timezone timestamp
-            value=value_f #reads sensor value
+            value=value_f, #reads sensor value
+            session_id=resolved_session_id,
+            created_at=datetime.utcnow()
         ))
         accepted += 1
 
     db.session.commit()
-    return jsonify({
+    if current_app.config.get("DEBUG_DEMO", False):
+        print(
+            f"[ingest] device={g.device.id} payload_session={payload_debug_session_id} "
+            f"active_session={g.device.active_session_id} resolved_session={resolved_session_id} "
+            f"accepted={accepted} rejected={rejected}"
+        )
+
+    response = {
         "device_id": g.device.id,
         "accepted": accepted,
         "rejected": rejected,
-        "errors": errors[:25]  # cap
-    }), 200
+        "errors": errors[:25],  # cap
+    }
+    if current_app.config.get("DEBUG_DEMO", False):
+        response["debug"] = {
+            "payload_session_id": payload_debug_session_id,
+            "active_session_id": g.device.active_session_id,
+            "resolved_session_id": resolved_session_id,
+            "device_id": g.device.id,
+            "accepted": accepted,
+            "rejected": rejected,
+        }
+    return jsonify(response), 200

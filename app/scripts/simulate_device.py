@@ -30,47 +30,52 @@ import json
 import uuid
 import secrets
 import random
+import math
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
+from dotenv import load_dotenv
+load_dotenv()
 
 # Must match app/routes/ingest.py ALLOWED_SENSORS
-SENSORS = [
-    "imu_ax", "imu_ay", "imu_az",
-    "imu_gx", "imu_gy", "imu_gz",
-    "emg_ch1", "emg_ch2", "emg_ch3", "emg_ch4",
-    "pressure_kpa", "hr_bpm"
-]
+SENSORS = ["hr_bpm", "pressure_kpa", "imu_gx", "imu_gy", "imu_gz", "emg_ch1", "emg_ch2"]
 
 
-def iso_utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def sensor_value(sensor: str) -> float:
-    if sensor.startswith("imu_a"):
-        return random.uniform(-2.0, 2.0)
+def sensor_value(sensor: str, t: float) -> float:
     if sensor.startswith("imu_g"):
-        return random.uniform(-250.0, 250.0)
+        base = 30.0
+        if sensor == "imu_gx":
+            return base * math.sin(t * 1.1)
+        if sensor == "imu_gy":
+            return base * math.cos(t * 0.9)
+        return base * math.sin(t * 0.7 + 1.2)
     if sensor.startswith("emg_"):
-        return random.uniform(0.0, 1.0)
+        noise = random.uniform(0.0, 0.12)
+        spike = 0.0
+        if random.random() < 0.08:
+            spike = random.uniform(0.2, 0.6)
+        return min(1.0, noise + spike)
     if sensor == "pressure_kpa":
-        return random.uniform(90.0, 110.0)
+        drift = 0.6 * math.sin(t * 0.05)
+        noise = random.uniform(-0.15, 0.15)
+        return 101.0 + drift + noise
     if sensor == "hr_bpm":
-        return random.uniform(55.0, 165.0)
+        wave = 15.0 * math.sin(t * 0.07) + 5.0 * math.sin(t * 0.23)
+        noise = random.uniform(-1.5, 1.5)
+        return 85.0 + wave + noise
     return random.uniform(0.0, 1.0)
 
 
-def build_batch(batch_size: int) -> dict:
+def build_batch(session_id: str) -> dict:
+    t = time.time()
     readings = []
-    for _ in range(batch_size):
-        s = random.choice(SENSORS)
+    for s in SENSORS:
         readings.append({
             "sensor": s,
-            "ts": iso_utc_now(),
-            "value": sensor_value(s)
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "value": sensor_value(s, t)
         })
-    return {"readings": readings}
+    return {"session_id": session_id, "readings": readings}
 
 
 def post_json(url: str, payload: dict, headers: dict) -> tuple[int, dict]:
@@ -78,6 +83,25 @@ def post_json(url: str, payload: dict, headers: dict) -> tuple[int, dict]:
     req = Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     for k, v in headers.items():
+        req.add_header(k, v)
+
+    try:
+        with urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8") if resp else ""
+            return resp.status, json.loads(body) if body else {}
+    except HTTPError as e:
+        body = e.read().decode("utf-8") if e.fp else ""
+        try:
+            return e.code, json.loads(body) if body else {"error": "http_error"}
+        except Exception:
+            return e.code, {"error": "http_error", "raw": body}
+    except URLError as e:
+        return 0, {"error": "url_error", "detail": str(e)}
+
+
+def get_json(url: str, headers: dict | None = None) -> tuple[int, dict]:
+    req = Request(url, method="GET")
+    for k, v in (headers or {}).items():
         req.add_header(k, v)
 
     try:
@@ -125,6 +149,8 @@ def main():
 
     seed_mode = os.getenv("SEED_DEVICE", "").strip() in ("1", "true", "TRUE", "yes", "YES")
 
+    session_id = None
+
     if seed_mode:
         device_id, api_key = seed_device_locally()
         print("Seeded a local device in the DB:")
@@ -133,26 +159,24 @@ def main():
         print("You can reuse these by setting environment variables next run.")
         print("----")
     else:
-        device_id = os.getenv("DEVICE_ID", "").strip()
-        api_key = os.getenv("API_KEY", "").strip()
-
-        # Demo-mode fallback (for hosted one-click demos or quick local runs)
-        demo_mode = os.getenv("DEMO_MODE", "").strip() in ("1", "true", "TRUE", "yes", "YES")
-        if (not device_id or not api_key) and demo_mode:
-            demo_device_id = os.getenv("DEMO_DEVICE_ID", "").strip()
-            demo_api_key = os.getenv("DEMO_API_KEY", "").strip()
-            if demo_device_id and demo_api_key:
-                device_id, api_key = demo_device_id, demo_api_key
-                print("Using DEMO_DEVICE_ID/DEMO_API_KEY credentials (DEMO_MODE=1).")
-                print(f"  DEVICE_ID = {device_id}")
-                print(f"  API_KEY   = {api_key}")
-                print("----")
-
-        if not device_id or not api_key:
-            print("Missing DEVICE_ID and/or API_KEY environment variables.")
-            print("Either set them, or set SEED_DEVICE=1 to auto-create a device locally,")
-            print("or set DEMO_MODE=1 with DEMO_DEVICE_ID and DEMO_API_KEY.")
+        creds_url = os.getenv("DEMO_CREDENTIALS_URL", "http://127.0.0.1:5000/api/demo/credentials?rotate=0")
+        status, resp = get_json(creds_url)
+        if status == 0 or status >= 400:
+            print(f"Failed to fetch demo credentials from {creds_url}: {resp}")
             raise SystemExit(2)
+
+        device_id = (resp.get("device_id") or "").strip()
+        api_key = (resp.get("api_key") or "").strip()
+        session_id = (resp.get("session_id") or "").strip()
+        if not device_id or not api_key or not session_id:
+            print(f"Demo credentials response missing required fields: {resp}")
+            raise SystemExit(2)
+
+        print("Using /api/demo/credentials response.")
+        print(f"  DEVICE_ID  = {device_id}")
+        print(f"  API_KEY    = {api_key}")
+        print(f"  SESSION_ID = {session_id}")
+        print("----")
 
     batch_size = int(os.getenv("BATCH_SIZE", "25"))
     interval_ms = int(os.getenv("INTERVAL_MS", "250"))
@@ -168,12 +192,14 @@ def main():
 
     print(f"POST {ingest_url}")
     print(f"device_id={device_id}")
+    print(f"session_id={session_id}")
     print(f"batch_size={batch_size}, interval_ms={interval_ms}, loops={loops}")
     print("----")
 
     for i in range(1, loops + 1):
-        payload = build_batch(batch_size)
+        payload = build_batch(session_id=session_id)
         status, resp = post_json(ingest_url, payload, headers)
+        print(f"ingest accepted={resp.get('accepted')} session={session_id}")
 
         if status == 0:
             print(f"[{i}/{loops}] NETWORK ERROR: {resp}")

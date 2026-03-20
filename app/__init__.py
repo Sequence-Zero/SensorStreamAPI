@@ -3,17 +3,33 @@ from .config import Config #pulls in settings
 from .extensions import db #imports global SQLalchemy object
 from .routes import register_routes #imports register functions for endpoint blueprints
 import os
+from sqlalchemy import inspect, text
 from datetime import datetime, timezone
 from .models import Device
 
 def create_app(): 
+    from flask_cors import CORS # type: ignore
+
     app = Flask(__name__) #creating app object
     app.config.from_object(Config) #loads config constraints
+
+    cors_origins_env = os.getenv("CORS_ORIGINS", "")
+    cors_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+    if not cors_origins:
+        cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    CORS(
+        app,
+        resources={
+            r"/health": {"origins": cors_origins},
+            r"/api/*": {"origins": cors_origins},
+        },
+    )
 
     db.init_app(app) #attaches SQLalchemy to Flask instance - connection between app context
 
     with app.app_context(): #creates table readings 
         db.create_all()
+        ensure_schema_compatibility()
 
     register_routes(app) #registers all routes blueprints health/ingest/query
     ensure_demo_device(app) 
@@ -34,7 +50,7 @@ def ensure_demo_device(app):
         existing = db.session.get(Device, demo_device_id)
         if existing:
             # Keep the key synced (optional)
-            existing.api_key = demo_api_key
+            existing.set_api_key(demo_api_key)
             existing.last_seen_at = existing.last_seen_at or datetime.now(timezone.utc)
             db.session.commit()
             app.logger.info(f"Demo device ensured: {demo_device_id}")
@@ -45,3 +61,21 @@ def ensure_demo_device(app):
         db.session.add(d)
         db.session.commit()
         app.logger.info(f"Demo device created: {demo_device_id}")
+
+
+def ensure_schema_compatibility():
+    inspector = inspect(db.engine)
+
+    device_columns = {col["name"] for col in inspector.get_columns("devices")}
+    if "active_session_id" not in device_columns:
+        db.session.execute(text("ALTER TABLE devices ADD COLUMN active_session_id VARCHAR(36)"))
+        db.session.commit()
+
+    reading_columns = {col["name"] for col in inspector.get_columns("readings")}
+    if "session_id" not in reading_columns:
+        db.session.execute(text("ALTER TABLE readings ADD COLUMN session_id VARCHAR(36)"))
+        db.session.commit()
+
+    db.session.execute(text("CREATE INDEX IF NOT EXISTS ix_devices_active_session_id ON devices (active_session_id)"))
+    db.session.execute(text("CREATE INDEX IF NOT EXISTS ix_readings_session_id ON readings (session_id)"))
+    db.session.commit()
